@@ -80,9 +80,10 @@ def resonator_sigma_from_gap_sigma(sigma_gap: float) -> float:
 def calibrate_resonator_from_gap_gennorm(
     target_gap_beta: float,
     target_gap_sigma: float,
-    sample_size: int = 25000,
+    sample_size: int = 120000,
     seed: int = 12345,
-    maxiter: int = 35,
+    maxiter: int = 120,
+    seeds_per_eval: int = 3,
 ) -> tuple[float, float, float, float, float]:
     if target_gap_beta <= 0.0:
         raise ValueError("Empirical gap beta must be > 0")
@@ -90,6 +91,8 @@ def calibrate_resonator_from_gap_gennorm(
         raise ValueError("Empirical gap sigma must be > 0")
     if sample_size < 2000:
         raise ValueError("sample_size must be >= 2000")
+    if seeds_per_eval < 1:
+        raise ValueError("seeds_per_eval must be >= 1")
 
     # Good initial guess: preserve beta and use sqrt(2) variance scaling.
     beta0 = float(target_gap_beta)
@@ -101,15 +104,18 @@ def calibrate_resonator_from_gap_gennorm(
         beta_res = float(math.exp(float(x[0])))
         sigma_res = float(math.exp(float(x[1])))
         alpha_res = alpha_from_sigma_beta(sigma_res, beta_res)
-        rng = np.random.default_rng(seed)
-        d1 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
-        d2 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
-        gaps = d2 - d1
-        beta_gap, _mu_gap, alpha_gap = stats.gennorm.fit(gaps)
-        sigma_gap = generalized_normal_std(float(alpha_gap), float(beta_gap))
-        beta_rel_err = (float(beta_gap) - target_gap_beta) / max(target_gap_beta, 1e-12)
-        sigma_rel_err = (sigma_gap - target_gap_sigma) / max(target_gap_sigma, 1e-18)
-        return float(beta_rel_err * beta_rel_err + sigma_rel_err * sigma_rel_err)
+        total = 0.0
+        for k in range(seeds_per_eval):
+            rng = np.random.default_rng(seed + k)
+            d1 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
+            d2 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
+            gaps = d2 - d1
+            beta_gap, _mu_gap, alpha_gap = stats.gennorm.fit(gaps)
+            sigma_gap = generalized_normal_std(float(alpha_gap), float(beta_gap))
+            beta_rel_err = (float(beta_gap) - target_gap_beta) / max(target_gap_beta, 1e-12)
+            sigma_rel_err = (sigma_gap - target_gap_sigma) / max(target_gap_sigma, 1e-18)
+            total += float(beta_rel_err * beta_rel_err + sigma_rel_err * sigma_rel_err)
+        return total / float(seeds_per_eval)
 
     result = optimize.minimize(
         objective,
