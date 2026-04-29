@@ -11,7 +11,6 @@ from tkinter import messagebox, ttk
 
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy import optimize
 from scipy import stats
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -77,67 +76,22 @@ def resonator_sigma_from_gap_sigma(sigma_gap: float) -> float:
     return float(sigma_gap / math.sqrt(2.0))
 
 
-def calibrate_resonator_from_gap_gennorm(
-    target_gap_beta: float,
-    target_gap_sigma: float,
-    sample_size: int = 120000,
-    seed: int = 12345,
-    maxiter: int = 120,
-    seeds_per_eval: int = 3,
-) -> tuple[float, float, float, float, float]:
-    if target_gap_beta <= 0.0:
-        raise ValueError("Empirical gap beta must be > 0")
-    if target_gap_sigma <= 0.0:
-        raise ValueError("Empirical gap sigma must be > 0")
+def modeled_gap_params_from_resonator(
+    alpha_res: float, beta_res: float, sample_size: int = 10000, seed: int = 12345
+) -> tuple[float, float]:
+    if alpha_res <= 0.0:
+        raise ValueError("resonator alpha must be > 0")
+    if beta_res <= 0.0:
+        raise ValueError("resonator beta must be > 0")
     if sample_size < 2000:
         raise ValueError("sample_size must be >= 2000")
-    if seeds_per_eval < 1:
-        raise ValueError("seeds_per_eval must be >= 1")
-
-    # Good initial guess: preserve beta and use sqrt(2) variance scaling.
-    beta0 = float(target_gap_beta)
-    sigma0 = float(target_gap_sigma / math.sqrt(2.0))
-
-    bounds = [(math.log(0.2), math.log(20.0)), (math.log(max(sigma0 * 1e-3, 1e-12)), math.log(sigma0 * 1e3))]
-
-    def objective(x: np.ndarray) -> float:
-        beta_res = float(math.exp(float(x[0])))
-        sigma_res = float(math.exp(float(x[1])))
-        alpha_res = alpha_from_sigma_beta(sigma_res, beta_res)
-        total = 0.0
-        for k in range(seeds_per_eval):
-            rng = np.random.default_rng(seed + k)
-            d1 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
-            d2 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
-            gaps = d2 - d1
-            beta_gap, _mu_gap, alpha_gap = stats.gennorm.fit(gaps)
-            sigma_gap = generalized_normal_std(float(alpha_gap), float(beta_gap))
-            beta_rel_err = (float(beta_gap) - target_gap_beta) / max(target_gap_beta, 1e-12)
-            sigma_rel_err = (sigma_gap - target_gap_sigma) / max(target_gap_sigma, 1e-18)
-            total += float(beta_rel_err * beta_rel_err + sigma_rel_err * sigma_rel_err)
-        return total / float(seeds_per_eval)
-
-    result = optimize.minimize(
-        objective,
-        x0=np.asarray([math.log(beta0), math.log(sigma0)], dtype=float),
-        method="L-BFGS-B",
-        bounds=bounds,
-        options={"maxiter": maxiter, "ftol": 1e-8},
-    )
-    if not result.success:
-        raise RuntimeError(f"Calibration failed: {result.message}")
-
-    beta_res = float(math.exp(float(result.x[0])))
-    sigma_res = float(math.exp(float(result.x[1])))
-    alpha_res = alpha_from_sigma_beta(sigma_res, beta_res)
-
     rng = np.random.default_rng(seed)
     d1 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
     d2 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
     gaps = d2 - d1
-    beta_gap_fit, _mu_gap_fit, alpha_gap_fit = stats.gennorm.fit(gaps)
-    sigma_gap_fit = generalized_normal_std(float(alpha_gap_fit), float(beta_gap_fit))
-    return beta_res, alpha_res, sigma_res, float(beta_gap_fit), float(sigma_gap_fit)
+    beta_gap, _mu_gap, alpha_gap = stats.gennorm.fit(gaps)
+    sigma_gap = generalized_normal_std(float(alpha_gap), float(beta_gap))
+    return float(beta_gap), float(sigma_gap)
 
 
 def sample_generalized_normal_array(
@@ -467,8 +421,6 @@ class App:
             "beta_df": "2.0",
             "sigma_df": "1e-4",
             "sigma_gap_df": "1.414213562e-4",
-            "emp_gap_beta_df": "2.0",
-            "emp_gap_sigma_df": "1.414213562e-4",
             "q": "1e5",
             "widths": "10",
             "num_resonators": "1000",
@@ -483,7 +435,6 @@ class App:
         self.entries: dict[str, ttk.Entry] = {}
         self.y_scale_var = tk.StringVar(value="linear")
         self._updating_scale = False
-        self._last_gap_backcheck: dict[str, float] | None = None
 
         self._build_layout()
         self._sync_sigma_from_alpha_beta()
@@ -510,8 +461,6 @@ class App:
             ("beta_df", "Drift beta (2 = normal dist)"),
             ("sigma_df", "Drift sigma (resonator)"),
             ("sigma_gap_df", "Drift sigma (gap change)"),
-            ("emp_gap_beta_df", "Empirical gap beta"),
-            ("emp_gap_sigma_df", "Empirical gap sigma"),
             ("q", "Q"),
             ("widths", "Threshold widths"),
             ("num_resonators", "Num resonators"),
@@ -524,7 +473,6 @@ class App:
             ("plot_center_index", "Plot center index"),
         ]
         section_fields = [
-            ("Empirical Gap Inputs", ["emp_gap_beta_df", "emp_gap_sigma_df"]),
             ("Resonator Drift Inputs", ["alpha_df", "beta_df", "sigma_df", "sigma_gap_df"]),
             (
                 "Model Inputs",
@@ -556,18 +504,14 @@ class App:
                 self.entries[key] = entry
             row += 1
 
-        self.entries["alpha_df"].bind("<Return>", self._on_alpha_or_beta_changed)
-        self.entries["alpha_df"].bind("<FocusOut>", self._on_alpha_or_beta_changed)
-        self.entries["beta_df"].bind("<Return>", self._on_alpha_or_beta_changed)
-        self.entries["beta_df"].bind("<FocusOut>", self._on_alpha_or_beta_changed)
+        self.entries["alpha_df"].bind("<Return>", self._on_alpha_changed)
+        self.entries["alpha_df"].bind("<FocusOut>", self._on_alpha_changed)
+        self.entries["beta_df"].bind("<Return>", self._on_beta_changed)
+        self.entries["beta_df"].bind("<FocusOut>", self._on_beta_changed)
         self.entries["sigma_df"].bind("<Return>", self._on_sigma_changed)
         self.entries["sigma_df"].bind("<FocusOut>", self._on_sigma_changed)
         self.entries["sigma_gap_df"].bind("<Return>", self._on_gap_sigma_changed)
         self.entries["sigma_gap_df"].bind("<FocusOut>", self._on_gap_sigma_changed)
-        self.entries["emp_gap_beta_df"].bind("<Return>", self._on_empirical_gap_changed)
-        self.entries["emp_gap_beta_df"].bind("<FocusOut>", self._on_empirical_gap_changed)
-        self.entries["emp_gap_sigma_df"].bind("<Return>", self._on_empirical_gap_changed)
-        self.entries["emp_gap_sigma_df"].bind("<FocusOut>", self._on_empirical_gap_changed)
 
         button_row = row
         ttk.Button(controls, text="Run", command=self._run_and_plot).grid(row=button_row, column=0, sticky="ew", pady=(10, 4))
@@ -600,7 +544,6 @@ class App:
         for key, value in self.defaults.items():
             self.entries[key].delete(0, tk.END)
             self.entries[key].insert(0, value)
-        self._last_gap_backcheck = None
         self._sync_sigma_from_alpha_beta()
 
     def _set_entry_value(self, key: str, value: float) -> None:
@@ -650,8 +593,13 @@ class App:
         finally:
             self._updating_scale = False
 
-    def _on_alpha_or_beta_changed(self, _event: object | None = None) -> None:
+    def _on_alpha_changed(self, _event: object | None = None) -> None:
         self._sync_sigma_from_alpha_beta()
+        self._run_and_plot()
+
+    def _on_beta_changed(self, _event: object | None = None) -> None:
+        # Hold resonator sigma fixed when beta changes; update alpha to match.
+        self._sync_alpha_from_sigma_beta()
         self._run_and_plot()
 
     def _on_sigma_changed(self, _event: object | None = None) -> None:
@@ -661,39 +609,6 @@ class App:
     def _on_gap_sigma_changed(self, _event: object | None = None) -> None:
         self._sync_from_gap_sigma_beta()
         self._run_and_plot()
-
-    def _calibrate_from_gap(self, show_success_message: bool = False) -> None:
-        try:
-            target_beta = float(self.entries["emp_gap_beta_df"].get())
-            target_sigma = float(self.entries["emp_gap_sigma_df"].get())
-            beta_res, alpha_res, sigma_res, beta_gap_fit, sigma_gap_fit = calibrate_resonator_from_gap_gennorm(
-                target_gap_beta=target_beta,
-                target_gap_sigma=target_sigma,
-            )
-            self._updating_scale = True
-            self._set_entry_value("beta_df", beta_res)
-            self._set_entry_value("alpha_df", alpha_res)
-            self._set_entry_value("sigma_df", sigma_res)
-            self._set_entry_value("sigma_gap_df", gap_sigma_from_resonator_sigma(sigma_res))
-            self._last_gap_backcheck = {"beta_fit": beta_gap_fit, "sigma_fit": sigma_gap_fit}
-            self._updating_scale = False
-            self._run_and_plot()
-            if show_success_message:
-                messagebox.showinfo(
-                    "Calibration Complete",
-                    (
-                        f"Estimated resonator params:\n"
-                        f"beta={beta_res:.6g}\nalpha={alpha_res:.6g}\nsigma={sigma_res:.6g}\n\n"
-                        f"Back-check gap fit:\n"
-                        f"beta={beta_gap_fit:.6g}\nsigma={sigma_gap_fit:.6g}"
-                    ),
-                )
-        except Exception as exc:
-            self._updating_scale = False
-            messagebox.showerror("Calibration Error", str(exc))
-
-    def _on_empirical_gap_changed(self, _event: object | None = None) -> None:
-        self._calibrate_from_gap()
 
     def _read_params(self) -> Params:
         seed_text = self.entries["seed"].get().strip()
@@ -724,6 +639,12 @@ class App:
     def _run_and_plot(self) -> None:
         try:
             params = self._read_params()
+            gap_beta_model, gap_sigma_model = modeled_gap_params_from_resonator(
+                alpha_res=params.alpha_df,
+                beta_res=params.beta_df,
+                sample_size=max(2000, params.plot_trials),
+                seed=params.seed if params.seed is not None else 12345,
+            )
             (
                 results,
                 samples,
@@ -753,21 +674,11 @@ class App:
                     f"Theory Results (out of {params.num_resonators} resonators)",
                     f"Within threshold: {results.collision_fraction_analytic * params.num_resonators:.1f}",
                     f"Crossed:          {results.crossed_fraction_analytic * params.num_resonators:.1f}",
+                    "",
+                    "Modeled Gap Parameters",
+                    f"Beta:  {gap_beta_model:.4g}",
+                    f"Sigma: {gap_sigma_model:.4g}",
                     ]
-                    + (
-                        []
-                        if self._last_gap_backcheck is None
-                        else [
-                            "",
-                            "Gap Back-Check Relative Error (%)",
-                            (
-                                f"Beta:  {100.0 * (self._last_gap_backcheck['beta_fit'] - float(self.entries['emp_gap_beta_df'].get())) / max(float(self.entries['emp_gap_beta_df'].get()), 1e-12):.3g}%"
-                            ),
-                            (
-                                f"Sigma: {100.0 * (self._last_gap_backcheck['sigma_fit'] - float(self.entries['emp_gap_sigma_df'].get())) / max(float(self.entries['emp_gap_sigma_df'].get()), 1e-18):.3g}%"
-                            ),
-                        ]
-                    )
                 )
             )
         )
