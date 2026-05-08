@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import math
 import tkinter as tk
 from dataclasses import dataclass
 from functools import lru_cache
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -32,8 +33,8 @@ class Params:
     mu_df: float
     alpha_df: float
     beta_df: float
-    q: float
-    widths: float
+    collision_ratio: float
+    collision_crossover_tolerance_pct: float
     num_resonators: int
     trials: int
     seed: int | None
@@ -42,6 +43,9 @@ class Params:
     f0_hz: float
     plot_count: int
     plot_center_index: int
+    steps: int
+    step_corr: float
+    step_amp: float
 
 
 def resonator_frequency_hz(index: int, f_center_hz: float, spacing: float, center_index: int) -> float:
@@ -76,19 +80,39 @@ def resonator_sigma_from_gap_sigma(sigma_gap: float) -> float:
     return float(sigma_gap / math.sqrt(2.0))
 
 
-def modeled_gap_params_from_resonator(
-    alpha_res: float, beta_res: float, sample_size: int = 10000, seed: int = 12345
+def modeled_gap_params_from_steps(
+    mu_df: float,
+    alpha_df: float,
+    beta_df: float,
+    steps: int,
+    step_corr: float,
+    step_amp: float,
+    sample_size: int = 10000,
+    seed: int = 12345,
 ) -> tuple[float, float]:
-    if alpha_res <= 0.0:
+    if alpha_df <= 0.0:
         raise ValueError("resonator alpha must be > 0")
-    if beta_res <= 0.0:
+    if beta_df <= 0.0:
         raise ValueError("resonator beta must be > 0")
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if not -1.0 <= step_corr <= 1.0:
+        raise ValueError("step_corr must be between -1 and 1")
+    if step_amp < 0.0:
+        raise ValueError("step_amp must be >= 0")
     if sample_size < 2000:
         raise ValueError("sample_size must be >= 2000")
     rng = np.random.default_rng(seed)
-    d1 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
-    d2 = sample_generalized_normal_array(rng, 0.0, alpha_res, beta_res, size=sample_size)
-    gaps = d2 - d1
+    gaps = sample_gap_changes(
+        rng=rng,
+        mu_df=mu_df,
+        alpha_df=alpha_df,
+        beta_df=beta_df,
+        steps=steps,
+        step_corr=step_corr,
+        step_amp=step_amp,
+        n_samples=sample_size,
+    )
     beta_gap, _mu_gap, alpha_gap = stats.gennorm.fit(gaps)
     sigma_gap = generalized_normal_std(float(alpha_gap), float(beta_gap))
     return float(beta_gap), float(sigma_gap)
@@ -98,6 +122,73 @@ def sample_generalized_normal_array(
     rng: np.random.Generator, mu: float, alpha: float, beta: float, size: int | tuple[int, ...]
 ) -> np.ndarray:
     return np.asarray(stats.gennorm.rvs(beta, loc=mu, scale=alpha, size=size, random_state=rng), dtype=float)
+
+
+def sample_total_drifts(
+    rng: np.random.Generator,
+    mu_df: float,
+    alpha_df: float,
+    beta_df: float,
+    steps: int,
+    step_corr: float,
+    step_amp: float,
+    size: int | tuple[int, ...],
+) -> np.ndarray:
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if not -1.0 <= step_corr <= 1.0:
+        raise ValueError("step_corr must be between -1 and 1")
+    if step_amp < 0.0:
+        raise ValueError("step_amp must be >= 0")
+
+    prev = sample_generalized_normal_array(rng, mu_df, alpha_df, beta_df, size=size)
+    total = np.array(prev, copy=True)
+    if steps == 1:
+        return total
+
+    p = abs(step_corr)
+    sign = 1.0 if step_corr >= 0.0 else -1.0
+    amp = 1.0
+    for _ in range(1, steps):
+        amp *= step_amp
+        fresh = sample_generalized_normal_array(rng, mu_df, alpha_df, beta_df, size=size)
+        if p == 0.0:
+            curr = fresh
+        else:
+            use_corr = rng.random(size=size) < p
+            corr = sign * prev
+            curr = np.where(use_corr, corr, fresh)
+        total += amp * curr
+        prev = curr
+    return total
+
+
+def sample_gap_changes(
+    rng: np.random.Generator,
+    mu_df: float,
+    alpha_df: float,
+    beta_df: float,
+    steps: int,
+    step_corr: float,
+    step_amp: float,
+    n_samples: int,
+) -> np.ndarray:
+    d1 = sample_total_drifts(rng, mu_df, alpha_df, beta_df, steps, step_corr, step_amp, size=n_samples)
+    d2 = sample_total_drifts(rng, mu_df, alpha_df, beta_df, steps, step_corr, step_amp, size=n_samples)
+    return np.asarray(d2 - d1, dtype=float)
+
+
+def effective_std_scale(steps: int, step_corr: float, step_amp: float) -> float:
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if not -1.0 <= step_corr <= 1.0:
+        raise ValueError("step_corr must be between -1 and 1")
+    if step_amp < 0.0:
+        raise ValueError("step_amp must be >= 0")
+    weights = np.asarray([step_amp**k for k in range(steps)], dtype=float)
+    corr = np.asarray([[step_corr ** abs(i - j) for j in range(steps)] for i in range(steps)], dtype=float)
+    var_scale = float(weights @ corr @ weights)
+    return math.sqrt(max(var_scale, 0.0))
 
 
 @lru_cache(maxsize=32)
@@ -140,11 +231,25 @@ def diff_distribution_grid(alpha: float, beta: float) -> tuple[np.ndarray, np.nd
     return y, diff_pdf, diff_cdf
 
 
-def analytic_fractions(spacing: float, alpha_df: float, beta_df: float, q_factor: float, widths: float) -> tuple[float, float, float]:
-    diff_x, _, diff_cdf = diff_distribution_grid(alpha=alpha_df, beta=beta_df)
-    threshold = widths / q_factor
-    collision = float(np.interp(threshold - spacing, diff_x, diff_cdf, left=0.0, right=1.0))
-    crossed = float(np.interp(-spacing, diff_x, diff_cdf, left=0.0, right=1.0))
+def analytic_fractions(
+    spacing: float,
+    mu_df: float,
+    alpha_df: float,
+    beta_df: float,
+    collision_ratio: float,
+    steps: int,
+    step_corr: float,
+    step_amp: float,
+    seed: int | None,
+) -> tuple[float, float, float]:
+    _ = seed, mu_df  # kept for API compatibility
+    alpha_eff = alpha_df * effective_std_scale(steps=steps, step_corr=step_corr, step_amp=step_amp)
+    diff_x, _, diff_cdf = diff_distribution_grid(alpha=alpha_eff, beta=beta_df)
+    threshold = collision_ratio * spacing
+    cdf_hi = float(np.interp(threshold - spacing, diff_x, diff_cdf, left=0.0, right=1.0))
+    cdf_lo = float(np.interp(-threshold - spacing, diff_x, diff_cdf, left=0.0, right=1.0))
+    collision = max(0.0, cdf_hi - cdf_lo)
+    crossed = float(np.interp(-threshold - spacing, diff_x, diff_cdf, left=0.0, right=1.0))
     return threshold, collision, crossed
 
 
@@ -153,11 +258,13 @@ def monte_carlo_fractions(
     mu_df: float,
     alpha_df: float,
     beta_df: float,
-    q_factor: float,
-    widths: float,
+    collision_ratio: float,
     num_resonators: int,
     trials: int,
     seed: int | None,
+    steps: int,
+    step_corr: float,
+    step_amp: float,
 ) -> tuple[float, float, float]:
     if num_resonators < 2:
         raise ValueError("num_resonators must be at least 2")
@@ -165,14 +272,23 @@ def monte_carlo_fractions(
         raise ValueError("trials must be >= 1")
 
     rng = np.random.default_rng(seed)
-    threshold = widths / q_factor
+    threshold = collision_ratio * spacing
     pair_count = num_resonators - 1
 
-    dfs = sample_generalized_normal_array(rng, mu_df, alpha_df, beta_df, size=(trials, num_resonators))
+    dfs = sample_total_drifts(
+        rng=rng,
+        mu_df=mu_df,
+        alpha_df=alpha_df,
+        beta_df=beta_df,
+        steps=steps,
+        step_corr=step_corr,
+        step_amp=step_amp,
+        size=(trials, num_resonators),
+    )
     final_spacings = spacing + (dfs[:, 1:] - dfs[:, :-1])
     total_pairs = final_spacings.size
-    collide_hits = int(np.count_nonzero(final_spacings <= threshold))
-    crossed_hits = int(np.count_nonzero(final_spacings <= 0.0))
+    collide_hits = int(np.count_nonzero(np.abs(final_spacings) <= threshold))
+    crossed_hits = int(np.count_nonzero(final_spacings < -threshold))
 
     return threshold, collide_hits / total_pairs, crossed_hits / total_pairs
 
@@ -214,6 +330,9 @@ def sample_final_frequencies(
     selected: list[int],
     f_center_hz: float,
     center_index: int,
+    steps: int,
+    step_corr: float,
+    step_amp: float,
 ) -> tuple[list[float], list[np.ndarray]]:
     rng = np.random.default_rng(seed)
     starts = [resonator_frequency_hz(i, f_center_hz, spacing, center_index) for i in range(num_resonators)]
@@ -221,7 +340,16 @@ def sample_final_frequencies(
     alpha_hz = f_center_hz * alpha_df
     selected_arr = np.asarray(selected, dtype=int)
     base = np.asarray(starts, dtype=float)[selected_arr]
-    drifts = sample_generalized_normal_array(rng, mu_hz, alpha_hz, beta_df, size=(trials, selected_arr.size))
+    drifts = sample_total_drifts(
+        rng=rng,
+        mu_df=mu_hz,
+        alpha_df=alpha_hz,
+        beta_df=beta_df,
+        steps=steps,
+        step_corr=step_corr,
+        step_amp=step_amp,
+        size=(trials, selected_arr.size),
+    )
     by_resonator = [np.asarray(base[j] + drifts[:, j], dtype=float) for j in range(selected_arr.size)]
     return np.ravel(base[np.newaxis, :] + drifts).tolist(), by_resonator
 
@@ -237,10 +365,16 @@ def theory_curve_binned(
     plotted_selected: list[int],
     samples: list[float],
     bins: int,
+    steps: int,
+    step_corr: float,
+    step_amp: float,
+    seed: int | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mu_hz = f_center_hz * mu_df
     alpha_hz = f_center_hz * alpha_df
-    dist_x_hz, dist_pdf_hz = make_distribution_grid(alpha=alpha_hz, beta=beta_df)
+    _ = seed
+    alpha_hz_eff = alpha_hz * effective_std_scale(steps=steps, step_corr=step_corr, step_amp=step_amp)
+    dist_x_hz, dist_pdf_hz = make_distribution_grid(alpha=alpha_hz_eff, beta=beta_df)
     dist_cdf_hz = cdf_from_pdf_grid(dist_x_hz, dist_pdf_hz)
     edge_starts = np.asarray(
         [resonator_frequency_hz(i, f_center_hz, spacing, center_index) for i in edge_selected], dtype=float
@@ -278,8 +412,10 @@ def spacing_distribution(
     trials: int,
     seed: int | None,
     bins: int,
-    widths: float,
-    q: float,
+    collision_ratio: float,
+    steps: int,
+    step_corr: float,
+    step_amp: float,
 ) -> tuple[list[float], np.ndarray, np.ndarray, np.ndarray]:
     if pair_count < 1:
         raise ValueError("Need at least two plotted resonators to show spacing distribution.")
@@ -288,13 +424,20 @@ def spacing_distribution(
 
     rng = np.random.default_rng(seed)
     n_samples = pair_count * trials
-    deltas = sample_generalized_normal_array(rng, mu_df, alpha_df, beta_df, size=n_samples) - sample_generalized_normal_array(
-        rng, mu_df, alpha_df, beta_df, size=n_samples
+    deltas = sample_gap_changes(
+        rng=rng,
+        mu_df=mu_df,
+        alpha_df=alpha_df,
+        beta_df=beta_df,
+        steps=steps,
+        step_corr=step_corr,
+        step_amp=step_amp,
+        n_samples=n_samples,
     )
     samples = (spacing + deltas).tolist()
-    threshold = widths / q
+    threshold = collision_ratio * spacing
 
-    x_min = min(min(samples), threshold, 0.0)
+    x_min = min(min(samples), -threshold, 0.0)
     x_max = max(samples)
     pad = 0.05 * (x_max - x_min if x_max > x_min else 1.0)
     x_min -= pad
@@ -302,7 +445,8 @@ def spacing_distribution(
 
     bin_edges = np.histogram_bin_edges(samples, bins=bins, range=(x_min, x_max))
     x = np.linspace(x_min, x_max, 1200)
-    diff_x, diff_pdf, _ = diff_distribution_grid(alpha=alpha_df, beta=beta_df)
+    alpha_eff = alpha_df * effective_std_scale(steps=steps, step_corr=step_corr, step_amp=step_amp)
+    diff_x, diff_pdf, _ = diff_distribution_grid(alpha=alpha_eff, beta=beta_df)
     pdf = np.interp(x - spacing, diff_x, diff_pdf, left=0.0, right=0.0)
     return samples, bin_edges, x, pdf
 
@@ -326,18 +470,24 @@ def run_model(
         mu_df=params.mu_df,
         alpha_df=params.alpha_df,
         beta_df=params.beta_df,
-        q_factor=params.q,
-        widths=params.widths,
+        collision_ratio=params.collision_ratio,
         num_resonators=params.num_resonators,
         trials=params.trials,
         seed=params.seed,
+        steps=params.steps,
+        step_corr=params.step_corr,
+        step_amp=params.step_amp,
     )
     threshold_an, collision_an, crossed_an = analytic_fractions(
         spacing=params.spacing,
+        mu_df=params.mu_df,
         alpha_df=params.alpha_df,
         beta_df=params.beta_df,
-        q_factor=params.q,
-        widths=params.widths,
+        collision_ratio=params.collision_ratio,
+        steps=params.steps,
+        step_corr=params.step_corr,
+        step_amp=params.step_amp,
+        seed=params.seed,
     )
 
     results = Results(
@@ -367,8 +517,10 @@ def run_model(
         selected=plotted_selected,
         f_center_hz=params.f0_hz,
         center_index=center_index,
+        steps=params.steps,
+        step_corr=params.step_corr,
+        step_amp=params.step_amp,
     )
-
     bin_edges, bin_centers, theory_pdf_bins = theory_curve_binned(
         spacing=params.spacing,
         mu_df=params.mu_df,
@@ -380,6 +532,10 @@ def run_model(
         plotted_selected=plotted_selected,
         samples=samples,
         bins=params.plot_bins,
+        steps=params.steps,
+        step_corr=params.step_corr,
+        step_amp=params.step_amp,
+        seed=params.seed,
     )
 
     spacing_samples, spacing_edges, spacing_x, spacing_pdf = spacing_distribution(
@@ -391,8 +547,10 @@ def run_model(
         trials=params.plot_trials,
         seed=params.seed + 2000 if params.seed is not None else None,
         bins=params.plot_bins,
-        widths=params.widths,
-        q=params.q,
+        collision_ratio=params.collision_ratio,
+        steps=params.steps,
+        step_corr=params.step_corr,
+        step_amp=params.step_amp,
     )
 
     return (
@@ -416,13 +574,13 @@ class App:
         self.root.geometry("1250x760")
 
         self.defaults = {
-            "spacing": "0.0018",
-            "alpha_df": "1.414213562e-4",
-            "beta_df": "2.0",
-            "sigma_df": "1e-4",
-            "sigma_gap_df": "1.414213562e-4",
-            "q": "1e5",
-            "widths": "10",
+            "spacing": "0.0013886",
+            "collision_ratio": "0.5",
+            "collision_crossover_tolerance_pct": "5",
+            "alpha_df": "1.0e-6",
+            "beta_df": "0.32",
+            "sigma_df": "7.0e-5",
+            "sigma_gap_df": "1e-4",
             "num_resonators": "1000",
             "trials": "1000",
             "seed": "1",
@@ -431,13 +589,17 @@ class App:
             "f0_hz": "1e9",
             "plot_count": "3",
             "plot_center_index": "-1",
+            "steps": "1",
+            "step_corr": "0.5",
+            "step_amp": "1.0",
         }
+        self._sync_derived_defaults_from_gap_beta()
         self.entries: dict[str, ttk.Entry] = {}
         self.y_scale_var = tk.StringVar(value="linear")
         self._updating_scale = False
 
         self._build_layout()
-        self._sync_sigma_from_alpha_beta()
+        self._sync_from_gap_sigma_beta()
         self._run_and_plot()
 
     def _build_layout(self) -> None:
@@ -457,20 +619,21 @@ class App:
 
         labels = [
             ("spacing", "Relative spacing"),
-            ("alpha_df", "Drift alpha"),
-            ("beta_df", "Drift beta (2 = normal dist)"),
-            ("sigma_df", "Drift sigma (resonator)"),
-            ("sigma_gap_df", "Drift sigma (gap change)"),
-            ("q", "Q"),
-            ("widths", "Threshold widths"),
+            ("collision_ratio", "Collision ratio (x spacing)"),
+            ("collision_crossover_tolerance_pct", "% collision/crossover tolerance"),
+            ("alpha_df", "Drift alpha (1-step)"),
+            ("beta_df", "Drift beta (1-step, 2 = normal dist)"),
+            ("sigma_df", "Drift sigma (1-step resonator)"),
+            ("sigma_gap_df", "Drift sigma (1-step gap change)"),
             ("num_resonators", "Num resonators"),
             ("trials", "MC trials"),
             ("seed", "Seed (blank=random)"),
             ("plot_trials", "Plot trials/res"),
             ("plot_bins", "Plot bins"),
             ("f0_hz", "Center freq (Hz)"),
-            ("plot_count", "Plotted resonators"),
-            ("plot_center_index", "Plot center index"),
+            ("steps", "Number of steps"),
+            ("step_corr", "Step correlation (-1 to 1)"),
+            ("step_amp", "Relative step amplitude"),
         ]
         section_fields = [
             ("Resonator Drift Inputs", ["alpha_df", "beta_df", "sigma_df", "sigma_gap_df"]),
@@ -478,18 +641,18 @@ class App:
                 "Model Inputs",
                 [
                     "spacing",
-                    "q",
-                    "widths",
+                    "collision_ratio",
+                    "collision_crossover_tolerance_pct",
                     "num_resonators",
                     "trials",
                     "seed",
                     "plot_trials",
                     "plot_bins",
                     "f0_hz",
-                    "plot_count",
-                    "plot_center_index",
+                    "steps",
                 ],
             ),
+            ("Step Correlation Inputs", ["step_corr", "step_amp"]),
         ]
         label_map = {k: v for k, v in labels}
         row = 1
@@ -516,6 +679,9 @@ class App:
         button_row = row
         ttk.Button(controls, text="Run", command=self._run_and_plot).grid(row=button_row, column=0, sticky="ew", pady=(10, 4))
         ttk.Button(controls, text="Reset", command=self._reset_defaults).grid(row=button_row, column=1, sticky="ew", pady=(10, 4), padx=(8, 0))
+        button_row += 1
+        ttk.Button(controls, text="Save Params", command=self._save_params).grid(row=button_row, column=0, sticky="ew", pady=(2, 4))
+        ttk.Button(controls, text="Load Params", command=self._load_params).grid(row=button_row, column=1, sticky="ew", pady=(2, 4), padx=(8, 0))
 
         scale_row = button_row + 1
         ttk.Label(controls, text="Y-axis scale").grid(row=scale_row, column=0, sticky="w", pady=(8, 2))
@@ -532,6 +698,9 @@ class App:
         ttk.Label(controls, textvariable=self.results_var, justify="left").grid(
             row=scale_row + 1, column=0, columnspan=2, sticky="w", pady=(10, 0)
         )
+        self.requirement_var = tk.StringVar(value="")
+        self.requirement_label = tk.Label(controls, textvariable=self.requirement_var, justify="left", fg="black")
+        self.requirement_label.grid(row=scale_row + 2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         ttk.Label(plot_frame, text="Histogram + Theory Curve", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
         self.figure = Figure(figsize=(8.5, 6.8), dpi=100)
@@ -540,11 +709,57 @@ class App:
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
 
+    def _sync_derived_defaults_from_gap_beta(self) -> None:
+        sigma_gap = float(self.defaults["sigma_gap_df"])
+        beta = float(self.defaults["beta_df"])
+        sigma = resonator_sigma_from_gap_sigma(sigma_gap)
+        alpha = alpha_from_sigma_beta(sigma, beta)
+        self.defaults["sigma_df"] = f"{sigma:.12g}"
+        self.defaults["alpha_df"] = f"{alpha:.12g}"
+
     def _reset_defaults(self) -> None:
-        for key, value in self.defaults.items():
-            self.entries[key].delete(0, tk.END)
-            self.entries[key].insert(0, value)
-        self._sync_sigma_from_alpha_beta()
+        self._sync_derived_defaults_from_gap_beta()
+        for key, entry in self.entries.items():
+            value = self.defaults[key]
+            entry.delete(0, tk.END)
+            entry.insert(0, value)
+        self._sync_from_gap_sigma_beta()
+
+    def _save_params(self) -> None:
+        try:
+            path = filedialog.asksaveasfilename(
+                title="Save Parameters",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            payload = {key: entry.get() for key, entry in self.entries.items()}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as exc:
+            messagebox.showerror("Save Error", str(exc))
+
+    def _load_params(self) -> None:
+        try:
+            path = filedialog.askopenfilename(
+                title="Load Parameters",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                raise ValueError("Parameter file must contain a JSON object.")
+            for key, entry in self.entries.items():
+                if key in payload:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, str(payload[key]))
+            self._sync_from_gap_sigma_beta()
+            self._run_and_plot()
+        except Exception as exc:
+            messagebox.showerror("Load Error", str(exc))
 
     def _set_entry_value(self, key: str, value: float) -> None:
         entry = self.entries[key]
@@ -619,29 +834,46 @@ class App:
             mu_df=0.0,
             alpha_df=float(self.entries["alpha_df"].get()),
             beta_df=float(self.entries["beta_df"].get()),
-            q=float(self.entries["q"].get()),
-            widths=float(self.entries["widths"].get()),
+            collision_ratio=float(self.entries["collision_ratio"].get()),
+            collision_crossover_tolerance_pct=float(self.entries["collision_crossover_tolerance_pct"].get()),
             num_resonators=int(self.entries["num_resonators"].get()),
             trials=int(self.entries["trials"].get()),
             seed=seed_val,
             plot_trials=int(self.entries["plot_trials"].get()),
             plot_bins=int(self.entries["plot_bins"].get()),
             f0_hz=float(self.entries["f0_hz"].get()),
-            plot_count=int(self.entries["plot_count"].get()),
-            plot_center_index=int(self.entries["plot_center_index"].get()),
+            plot_count=int(self.defaults["plot_count"]),
+            plot_center_index=int(self.defaults["plot_center_index"]),
+            steps=int(self.entries["steps"].get()),
+            step_corr=float(self.entries["step_corr"].get()),
+            step_amp=float(self.entries["step_amp"].get()),
         )
         if params.alpha_df <= 0.0:
             raise ValueError("Drift alpha must be > 0")
         if params.beta_df <= 0.0:
             raise ValueError("Drift beta must be > 0")
+        if params.steps < 1:
+            raise ValueError("Number of steps must be >= 1")
+        if not -1.0 <= params.step_corr <= 1.0:
+            raise ValueError("Step correlation must be between -1 and 1")
+        if params.step_amp < 0.0:
+            raise ValueError("Relative step amplitude must be >= 0")
+        if params.collision_ratio < 0.0:
+            raise ValueError("Collision ratio must be >= 0")
+        if not 0.0 <= params.collision_crossover_tolerance_pct <= 100.0:
+            raise ValueError("% collision/crossover tolerance must be between 0 and 100")
         return params
 
     def _run_and_plot(self) -> None:
         try:
             params = self._read_params()
-            gap_beta_model, gap_sigma_model = modeled_gap_params_from_resonator(
-                alpha_res=params.alpha_df,
-                beta_res=params.beta_df,
+            gap_beta_model, gap_sigma_model = modeled_gap_params_from_steps(
+                mu_df=params.mu_df,
+                alpha_df=params.alpha_df,
+                beta_df=params.beta_df,
+                steps=params.steps,
+                step_corr=params.step_corr,
+                step_amp=params.step_amp,
                 sample_size=max(2000, params.plot_trials),
                 seed=params.seed if params.seed is not None else 12345,
             )
@@ -661,29 +893,45 @@ class App:
             messagebox.showerror("Input/Model Error", str(exc))
             return
 
-        self.results_var.set(
-            "\n".join(
-                (
-                    [
-                    f"Collision threshold (rel): {results.threshold:.6g}",
-                    "",
-                    f"MC Results (out of {params.num_resonators} resonators)",
-                    f"Within threshold: {results.collision_fraction_mc * params.num_resonators:.1f}",
-                    f"Crossed:          {results.crossed_fraction_mc * params.num_resonators:.1f}",
-                    "",
-                    f"Theory Results (out of {params.num_resonators} resonators)",
-                    f"Within threshold: {results.collision_fraction_analytic * params.num_resonators:.1f}",
-                    f"Crossed:          {results.crossed_fraction_analytic * params.num_resonators:.1f}",
-                    "",
-                    "Modeled Gap Parameters",
-                    f"Beta:  {gap_beta_model:.4g}",
-                    f"Sigma: {gap_sigma_model:.4g}",
-                    ]
-                )
-            )
-        )
+        combined_mc_fraction = results.collision_fraction_mc + results.crossed_fraction_mc
+        estimated_safe_pct = max(0.0, 100.0 * (1.0 - combined_mc_fraction))
+        tolerance_fraction = params.collision_crossover_tolerance_pct / 100.0
+        requirement_failed = combined_mc_fraction > tolerance_fraction
 
-        threshold = params.widths / params.q
+        summary_lines = [
+            f"Collision threshold (rel): {results.threshold:.6g}",
+            f"Estimated non-collide/non-cross: {estimated_safe_pct:.2f}%",
+            "",
+            f"MC Results (out of {params.num_resonators} resonators)",
+            f"Within threshold: {results.collision_fraction_mc * params.num_resonators:.1f}",
+            f"Crossed:          {results.crossed_fraction_mc * params.num_resonators:.1f}",
+            f"Collision + crossover: {combined_mc_fraction * 100.0:.2f}% (tolerance {params.collision_crossover_tolerance_pct:.2f}%)",
+            "",
+        ]
+        summary_lines.extend(
+            [
+                f"Simple Theory Results (out of {params.num_resonators} resonators)",
+                f"Within threshold: {results.collision_fraction_analytic * params.num_resonators:.1f}",
+                f"Crossed:          {results.crossed_fraction_analytic * params.num_resonators:.1f}",
+                "",
+            ]
+        )
+        summary_lines.extend(
+            [
+                "Modeled Gap Parameters",
+                f"Beta:  {gap_beta_model:.4g}",
+                f"Sigma: {gap_sigma_model:.4g}",
+            ]
+        )
+        self.results_var.set("\n".join(summary_lines))
+        if requirement_failed:
+            self.requirement_label.configure(fg="red")
+            self.requirement_var.set("FAIL: collision + crossover exceeds tolerance requirement.")
+        else:
+            self.requirement_label.configure(fg="black")
+            self.requirement_var.set("PASS: collision + crossover is within tolerance requirement.")
+
+        threshold = params.collision_ratio * params.spacing
 
         self.ax_freq.clear()
         # Stacked per-resonator histogram: each resonator contributes area 1.
@@ -714,7 +962,7 @@ class App:
             marker="None",
             linewidth=2.2,
             color="tab:red",
-            label="Theory curve",
+            label="Simple theory",
         )
         self.ax_freq.set_xlabel("Final frequency (GHz)")
         self.ax_freq.set_ylabel("# resonators per bin")
@@ -741,24 +989,25 @@ class App:
             color="0.7",
             label="Spacing histogram",
         )
-        spacing_centers = 0.5 * (spacing_edges[:-1] + spacing_edges[1:])
-        diff_x, _, diff_cdf = diff_distribution_grid(alpha=params.alpha_df, beta=params.beta_df)
-        theory_counts = np.asarray([
-            params.num_resonators
-            * (
-                float(np.interp(spacing_edges[i + 1] - params.spacing, diff_x, diff_cdf, left=0.0, right=1.0))
-                - float(np.interp(spacing_edges[i] - params.spacing, diff_x, diff_cdf, left=0.0, right=1.0))
-            )
-            for i in range(len(spacing_centers))
-        ])
         spacing_bin_width_rel = float(spacing_edges[1] - spacing_edges[0]) if len(spacing_edges) > 1 else 0.0
         spacing_bin_khz = spacing_bin_width_rel * params.f0_hz / 1e3
-        self.ax_spacing.plot(spacing_centers, theory_counts, color="tab:red", linewidth=2.2, label="Theory curve")
-        self.ax_spacing.axvspan(spacing_edges[0], threshold, color="tab:orange", alpha=0.15, label="Collision region")
-        self.ax_spacing.axvline(threshold, color="tab:orange", linestyle="--", linewidth=1.8, label="Threshold")
-        self.ax_spacing.axvline(0.0, color="black", linestyle=":", linewidth=1.6, label="Crossing boundary")
+        spacing_counts_pdf = np.asarray(spacing_pdf) * spacing_bin_width_rel * params.num_resonators
+        self.ax_spacing.plot(spacing_x, spacing_counts_pdf, color="tab:red", linewidth=2.2, label="Simple theory")
+        # Use non-overlapping shading for readability:
+        # crossed region: spacing < -threshold, collision region: -threshold <= spacing <= threshold.
+        crossed_left = spacing_edges[0]
+        crossed_right = min(-threshold, spacing_edges[-1])
+        if crossed_left < crossed_right:
+            self.ax_spacing.axvspan(crossed_left, crossed_right, color="tab:orange", alpha=0.08, label="Crossed region")
+        collide_left = max(-threshold, spacing_edges[0])
+        collide_right = min(threshold, spacing_edges[-1])
+        if collide_left < collide_right:
+            self.ax_spacing.axvspan(collide_left, collide_right, color="tab:orange", alpha=0.18, label="Collision region")
+        self.ax_spacing.axvline(-threshold, color="tab:orange", linestyle="--", linewidth=1.8, label="Threshold")
+        self.ax_spacing.axvline(threshold, color="tab:orange", linestyle="--", linewidth=1.8)
         self.ax_spacing.set_xlabel("Adjacent final spacing (relative units)")
         self.ax_spacing.set_ylabel("# resonators per bin")
+        self.ax_spacing.set_xlim(-0.001, 0.004)
         self.ax_spacing.set_title(
             f"Adjacent-Pair Spacing with Collision Threshold (sum = Num resonators, bin = {spacing_bin_khz:.3g} kHz)"
         )
